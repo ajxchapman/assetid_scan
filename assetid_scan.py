@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import difflib
+import fnmatch
 import glob
 import hashlib
 import re
@@ -14,14 +15,21 @@ import tempfile
 
 import git
 
-asset_cache = {}
+asset_cache = None
+session = requests.Session()
 def get_asset(asset_path):
-    if asset_path in asset_cache:
-        return asset_cache[asset_path]
+    global asset_cache
+    if asset_cache is None:
+        asset_cache = {}
+
+    path_hash = hashlib.sha256(asset_path.encode()).hexdigest()
+    if path_hash in asset_cache:
+        return asset_cache[path_hash]
 
     # Fetch the asset data
     if re.match("^https?://", asset):
-        r = requests.get(asset)
+        print("Fetching {}...".format(asset))
+        r = session.get(asset)
         # Github uses UTF-8 encoding, check others
         r.encoding = "UTF-8"
         if r.status_code == 200:
@@ -34,7 +42,7 @@ def get_asset(asset_path):
         with open(asset, "rb") as f:
             asset_data = f.read().decode("UTF-8")
 
-    asset_cache[asset_path] = asset_data
+    asset_cache[path_hash] = asset_data
     return asset_data
 
 class CodeBase:
@@ -108,7 +116,6 @@ class CodeBase:
                 lookup = os.path.basename(path)
                 self.dir_listing.setdefault(lookup, []).append(path)
 
-
         pathid_parts = asset_path.split("/")
         dir_listing = self.dir_listing.get(os.path.basename(asset_path), [])
         for i in range(1, len(pathid_parts) + 1):
@@ -134,7 +141,7 @@ class CodeBase:
         with open(codebase_path) as f:
             codebase_data = f.read()
         ratio = difflib.SequenceMatcher(None, asset_data, codebase_data).quick_ratio()
-        print("{}:{} [{}]".format(asset, codebase_path, ratio))
+        # print("{}:{} [{}]".format(asset, codebase_path, ratio))
         return ratio
 
 
@@ -142,6 +149,7 @@ class TarCodeBase(CodeBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tarfile = None
+        self.base_dir = ""
 
     def list_files(self):
         paths = []
@@ -150,7 +158,12 @@ class TarCodeBase(CodeBase):
         with tarfile.open(self.saved_path, "r:*") as f:
             for member in f.getmembers():
                 if member.isfile():
-                    paths.append(member.name)
+                    paths.append(member.name.lstrip(os.path.sep))
+
+        basedir = paths[0].split(os.path.sep)[0]
+        if all(x.startswith(basedir) for x in paths):
+            self.base_dir = basedir
+            paths = [x.replace(basedir, "", 1) for x in paths]
         return paths
 
     def compare(self, asset, codebase_path):
@@ -159,11 +172,11 @@ class TarCodeBase(CodeBase):
         if self.tarfile is None:
             self.tarfile = tarfile.open(self.saved_path, "r:*")
 
-        member = self.tarfile.getmember(codebase_path)
+        member = self.tarfile.getmember(os.path.join(self.base_dir, codebase_path.lstrip(os.path.sep)))
         codebase_data = self.tarfile.extractfile(member).read().decode("UTF-8")
 
         ratio = 1 if asset_data == codebase_data else difflib.SequenceMatcher(None, asset_data, codebase_data).quick_ratio()
-        print("{}:{} [{}]".format(asset, codebase_path, ratio))
+        # print("{}:{} [{}]".format(asset, codebase_path, ratio))
         return ratio
 
 class GitCodeBase(CodeBase):
@@ -235,7 +248,10 @@ class GitCodeBase(CodeBase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AssetId Scanner")
-    parser.add_argument("--code", "-c", type=str, action="append", help="the code base to work on")
+    parser.add_argument("--code", "-c", type=str, default=[], action="append", help="the code base to work on")
+    parser.add_argument("--url", "-u", type=str, default=None, help="the base URL to download assets from")
+    parser.add_argument("--glob", "-g", type=str, default="*", help="the glob for files to search for")
+    parser.add_argument("--ignore", "-i", type=str, default=[], help="the glob for files to search for")
     # parser.add_argument("--branch", "-b", type=str, default="master")
     parser.add_argument("assets", nargs="*")
 
@@ -260,23 +276,31 @@ if __name__ == "__main__":
             else:
                 codebases.append(c)
 
-    assets = []
+    assets = set()
     for asset in args.assets:
         if os.path.isdir(asset):
             for root, subdirs, files in os.walk(asset):
                 for file in files:
-                    assets.append(os.path.join(root, file))
+                    assets.add(os.path.join(root, file))
         else:
-            assets.append(asset)
+            assets.add(asset)
+    if args.url is not None:
+        url = args.url.rstrip("/")
+        for codebase in codebases:
+            for asset in codebase.list_files():
+                if "/{}".format(asset.lstrip("/")) in args.ignore:
+                    continue
+                if fnmatch.fnmatch(asset, args.glob):
+                    assets.add("{}/{}".format(args.url, asset.lstrip("/")))
+    print(assets)
 
+    possibles = [x.path for x in codebases]
     for codebase in codebases:
         print("[+] {}".format(codebase.path))
         for asset in assets:
-
             codebase_path = None
-
-            # No codebase path specified
             try:
+                # No codebase path specified
                 if re.match("^(https?://)?[^:]+$", asset):
                     # Attempt to automatically identify the git repo asset path
                     codebase_path = codebase.find_file(asset)
@@ -289,7 +313,16 @@ if __name__ == "__main__":
 
             try:
                 if codebase.compare(asset, codebase_path) < 1:
-                    print("[!] Unmatched file, moving on")
+                    print("[!] Unmatched file '{}', moving on".format(codebase_path))
+                    possibles.remove(codebase.path)
                     break
             except Exception as e:
                 print("[!] compare: {}".format(str(e)))
+
+    print()
+    if len(possibles):
+        print("Possible code bases:")
+        for x in possibles:
+            print("\t{}".format(x))
+    else:
+        print("No identified code bases")
